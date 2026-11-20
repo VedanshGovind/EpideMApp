@@ -2,7 +2,7 @@
 import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-gl.mjs";
 
 /* ============================================================
-   PandeMApp — dashboard logic
+   EpideMApp - dashboard logic
    • MapLibre GL map locked to India
    • Real community reports (Firestore, with local fallback)
    • Optional Google sign-in
@@ -14,14 +14,14 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
   const Store = window.HealthMapStore;
   const Images = window.HealthMapImages;
   /* Tile chain + disease lists live in store.js (window.HealthMapConfig) because
-     both pages load it — one shared copy instead of an extra module each. */
+     both pages load it - one shared copy instead of an extra module each. */
   const { TILE_PROVIDERS, styleFor, TILE_STORE_KEY, errorStatus, isDecisive,
           ZOONOTIC_TYPES, ZOONOTIC_EXPOSURE } = window.HealthMapConfig;
   const auth = fb.auth;
   const db = fb.db;
 
   /* ---------------- report catalogue ----------------
-     `category` is what the database stores and must stay "disease" or "risk" —
+     `category` is what the database stores and must stay "disease" or "risk" -
      the published rules reject anything else.
      `group` is what the UI sorts by: illness, risk, or animal-spread. */
   const ANIMAL_COLOR = "#F5A623";   // the whole animal group shares one colour
@@ -41,7 +41,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
 
   /* Animal-spread diseases. Names and descriptions come from the shared config in
      store.js; only the emoji and the colour live here. They share one colour so the
-     map stays readable — the emoji on each pin tells them apart. */
+     map stays readable - the emoji on each pin tells them apart. */
   const ANIMAL_ICONS = {
     rabies: "🐕", nipah: "🦇", leptospirosis: "💧", anthrax: "🐄",
     brucellosis: "🐐", plague: "🐀", kyasanur: "🕷️", cchf: "🩸",
@@ -96,10 +96,17 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
   let userLatLng = null;          // jittered display location
   let userMarker = null;
   let allReports = [];
-  // "other_risk" is the bucket for legacy/unrecognised reports — it has no card
+  // "other_risk" is the bucket for legacy/unrecognised reports - it has no card
   // or chip of its own, but must stay visible so old data never disappears.
   let visibleTypes = new Set(Object.keys(TYPES).concat(["other_risk"]));
-  let timeWindow = 30;            // days
+  let timeWindow = 10;            // days - default is the last 10 days; "custom" uses customFrom/customTo
+  let customFrom = 0;             // ms timestamps for the custom date range (0 = open-ended)
+  let customTo = 0;
+  let radiusKm = 0;               // 0 = anywhere in India
+  let radiusCentre = null;        // { lat, lng, label } - fixed when the radius is chosen
+  let searchedCity = null;        // last city found by the city search
+  let ringData = { type: "FeatureCollection", features: [] };   // radius outline, re-applied after a style swap
+  let ringDirty = false;
   let currentUser = null;
   let markers = [];               // MapLibre markers currently on the map
   const markerIndex = new Map();  // id -> { layer, report }
@@ -115,7 +122,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
   const INDIA_CENTER = [78.9629, 20.5937];        // [lng, lat]
   const EMPTY_FC = { type: "FeatureCollection", features: [] };
 
-  /* The tile chain itself lives in basemap.js — it is shared with the
+  /* The tile chain itself lives in basemap.js - it is shared with the
      animal-spread disease form, so there is only one list to maintain. */
 
   /* Bump this whenever TILE_PROVIDERS changes. It is printed on load so you can
@@ -125,7 +132,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
 
 
   /* OpenFreeMap's and CARTO's vector styles carry no attribution of their own,
-     which leaves OpenStreetMap's contributors uncredited — and ODbL requires
+     which leaves OpenStreetMap's contributors uncredited - and ODbL requires
      credit. Rather than fight MapLibre's AttributionControl (it keeps a shared
      list, so swapping controls only appends), the map shows its own credit line,
      rewritten whenever the provider changes. Handy side effect: the corner of the
@@ -141,10 +148,10 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
   /* Pick the starting provider: ?tiles= beats a remembered one. */
   function announceBuild() {
     const chain = TILE_PROVIDERS.map((p) => p.id).join(" → ");
-    console.info("%c[PandeMApp] build " + BUILD_ID + "%c  basemap chain: " + chain,
+    console.info("%c[EpideMApp] build " + BUILD_ID + "%c  basemap chain: " + chain,
       "font-weight:bold", "font-weight:normal");
     if (TILE_PROVIDERS.some((p) => p.id === "carto")) {
-      console.warn("[PandeMApp] CARTO is only included when CARTO_KEY is set — if you see this with an empty key, you are running an old cached dashboard.js.");
+      console.warn("[EpideMApp] CARTO is only included when CARTO_KEY is set - if you see this with an empty key, you are running an old cached dashboard.js.");
     }
   }
 
@@ -159,7 +166,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
       if (!saved) return 0;
       const i = TILE_PROVIDERS.findIndex((p) => p.id === saved);
       if (i >= 0) return i;
-      // remembered a provider that has since been removed (e.g. carto) — forget it
+      // remembered a provider that has since been removed (e.g. carto) - forget it
       localStorage.removeItem(TILE_STORE_KEY);
     } catch (e) { /* private mode */ }
     return 0;
@@ -205,7 +212,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
        • The result is a compact data URL that fits inside a Firestore document
          (1 MB limit), so no Storage bucket, rules change or billing is needed. */
   /* The compressor lives in store.js (window.HealthMapImages) because the
-     animal-spread form uses the identical pipeline — a photo behaves the same
+     animal-spread form uses the identical pipeline - a photo behaves the same
      whichever form it was attached from. */
   const compressImage = (file) => Images.compress(file);
 
@@ -229,8 +236,8 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
   }
 
   /* Google serves profile photos from lh3.googleusercontent.com. When that
-     request fails — a host content-security policy, a strict network, a photo
-     the account no longer exposes — the <img> renders as an empty box and the
+     request fails - a host content-security policy, a strict network, a photo
+     the account no longer exposes - the <img> renders as an empty box and the
      profile picture quietly "disappears". So build the image in script, listen
      for the failure, and fall back to the person's initials: the button and the
      panel then always show something that is clearly theirs. */
@@ -290,26 +297,109 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
   }
 
   function photoHintFor(group) {
-    if (group === "animal") return "A photo of the animal, the bite or wound, or the doctor's note helps — cover faces, names and house numbers first.";
+    if (group === "animal") return "A photo of the animal, the bite or wound, or a PDF of the doctor's note helps - hide faces, names and house numbers first. Images or PDFs up to about 500 KB.";
     return group === "illness"
-      ? "A photo of the doctor's note or test report helps confirm it — cover names, IDs and any other personal details first."
-      : "A photo of the place — a drain, puddle, tank or dump site — helps others confirm it and act on it.";
+      ? "A photo or PDF of the doctor's note or test report helps confirm it - hide names, IDs and other personal details first. Images or PDFs up to about 500 KB."
+      : "A photo of the place - a drain, puddle, tank or dump site - helps others confirm it and act on it.";
   }
 
-  function setPendingPhoto(dataUrl) {
-    pendingPhoto = dataUrl || null;
-    const img = $("photoPreviewImg"), box = $("photoPreview"), rm = $("photoRemoveBtn");
-    if (pendingPhoto) {
-      img.src = pendingPhoto;
+  /* ---- attachments: one image (compressed) or one small PDF per report ---- */
+  const MAX_PDF_BYTES = 500 * 1024;   // keeps the Firestore document under its 1 MB limit
+
+  const FILE_UI = {
+    main:   { img: "photoPreviewImg",       box: "photoPreview",       rm: "photoRemoveBtn",       pick: "photoPickBtn",       input: "photoInput",       chip: "photoFileChip" },
+    animal: { img: "animalPhotoPreviewImg", box: "animalPhotoPreview", rm: "animalPhotoRemoveBtn", pick: "animalPhotoPickBtn", input: "animalPhotoInput", chip: "animalFileChip" }
+  };
+
+  function isPdf(file) { return file.type === "application/pdf" || /\.pdf$/i.test(file.name || ""); }
+
+  function readAsDataUrl(file) {
+    return new Promise((resolve, reject) => {
+      const fr = new FileReader();
+      fr.onload = () => resolve(fr.result);
+      fr.onerror = () => reject(new Error("Could not read that file."));
+      fr.readAsDataURL(file);
+    });
+  }
+
+  async function prepareFile(file) {
+    if (/^image\//.test(file.type)) {
+      return { kind: "image", dataUrl: await compressImage(file), name: file.name || "image" };
+    }
+    if (isPdf(file)) {
+      if (file.size > MAX_PDF_BYTES) {
+        throw new Error("That PDF is " + Math.round(file.size / 1024) + " KB - please keep PDFs under 500 KB, or attach an image of the key page.");
+      }
+      const raw = await readAsDataUrl(file);
+      // some browsers label PDFs application/octet-stream - normalise so it can be validated later
+      const dataUrl = String(raw).replace(/^data:[^;,]*;base64,/, "data:application/pdf;base64,");
+      return { kind: "pdf", dataUrl: dataUrl, name: file.name || "document.pdf" };
+    }
+    throw new Error("Please choose an image or a PDF file.");
+  }
+
+  function fileKb(f) { return Math.round((f.dataUrl.length * 3) / 4 / 1024); }
+  function imageOf(f) { return f && f.kind === "image" ? f.dataUrl : null; }
+  function attachmentExtra(f) {
+    return f && f.kind === "pdf"
+      ? { attachment: f.dataUrl, attachmentName: f.name, attachmentType: "application/pdf" }
+      : {};
+  }
+
+  function paintFile(ui, f) {
+    const img = $(ui.img), box = $(ui.box), chip = $(ui.chip);
+    if (f && f.kind === "image") {
+      img.src = f.dataUrl;
       box.hidden = false;
-      rm.hidden = false;
-      $("photoPickBtn").textContent = "📷 Replace photo";
+      chip.hidden = true;
+    } else if (f) {
+      img.removeAttribute("src");
+      box.hidden = true;
+      chip.hidden = false;
+      chip.innerHTML = "<span>📄</span><span>" + escapeHtml(f.name) + " <small>· PDF · " + fileKb(f) + " KB</small></span>";
     } else {
       img.removeAttribute("src");
       box.hidden = true;
-      rm.hidden = true;
-      $("photoPickBtn").textContent = "📷 Add a photo";
-      $("photoInput").value = "";
+      chip.hidden = true;
+      chip.textContent = "";
+      $(ui.input).value = "";
+    }
+    $(ui.rm).hidden = !f;
+    $(ui.pick).textContent = f ? "📎 Replace file" : "📎 Add a file";
+  }
+
+  function setPendingPhoto(f) {
+    pendingPhoto = f || null;
+    paintFile(FILE_UI.main, pendingPhoto);
+  }
+
+  function attachmentUrl(r) {
+    const v = r && r.attachment;
+    return (typeof v === "string" && v.length <= 800000 &&
+            /^data:application\/pdf;base64,[A-Za-z0-9+/=]+$/.test(v)) ? v : "";
+  }
+
+  function fileLinkHtml(r) {
+    return attachmentUrl(r)
+      ? '<a href="#" class="file-link" data-fileid="' + escapeHtml(r.id) + '">📄 ' + escapeHtml(r.attachmentName || "Attached PDF") + "</a>"
+      : "";
+  }
+
+  /* A data: URL can't be opened as a top-level page in most browsers, so turn it into a Blob first. */
+  function openAttachment(id) {
+    const r = allReports.find((x) => x.id === id);
+    const url = r && attachmentUrl(r);
+    if (!url) return;
+    try {
+      const bin = atob(url.split(",")[1]);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const blobUrl = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
+      const w = window.open(blobUrl, "_blank", "noopener");
+      if (!w) toast("Allow pop-ups to open the file.", "info");
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+    } catch (err) {
+      toast("Couldn't open that file.", "error");
     }
   }
 
@@ -344,7 +434,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
     return currentUser ? currentUser.uid : Store.guestId();
   }
 
-  /* Deleting a cloud report requires a signed-in author — see firestore.rules.
+  /* Deleting a cloud report requires a signed-in author - see firestore.rules.
      A guest can't prove ownership to the server, so their only working path is
      a report held locally. Never offer a button that is guaranteed to fail. */
   function canWithdraw(r) {
@@ -363,9 +453,9 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
   function pinElement(typeKey) {
     const t = typeInfo(typeKey);
     const el = document.createElement("div");
-    el.className = "report-pin" + (t.group === "illness" ? " disease" : "");
-    el.style.background = t.color;
-    el.innerHTML = "<span>" + t.icon + "</span>";
+    el.className = "report-dot";
+    el.title = t.label;
+    el.innerHTML = '<i style="background:' + t.color + '"></i>';
     return el;
   }
 
@@ -383,7 +473,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
   let circleDirty = false;
   const providerLog = [];
 
-  /* maxBounds only constrains the map CENTRE — at low zoom the viewport is wider
+  /* maxBounds only constrains the map CENTRE - at low zoom the viewport is wider
      than India, so neighbouring countries would still show. This returns the
      lowest zoom at which the viewport fits entirely inside India's box.
      MapLibre's world is tileSize(512) × 2^zoom pixels. */
@@ -411,7 +501,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
   function initMap() {
     announceBuild();
     if (typeof maplibregl === "undefined") {
-      $("mapLoading").innerHTML = "<p>MAP LIBRARY FAILED TO LOAD — CHECK YOUR CONNECTION</p>";
+      $("mapLoading").innerHTML = "<p>MAP LIBRARY FAILED TO LOAD - CHECK YOUR CONNECTION</p>";
       return;
     }
 
@@ -434,10 +524,10 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
     setCredit(TILE_PROVIDERS[providerIndex]);
 
     // "load" fires for the first style only, "idle" once the map has actually
-    // drawn tiles — after a failover there is no second "load", so both paths
+    // drawn tiles - after a failover there is no second "load", so both paths
     // end in mapReady().
     /* "Ready" means tiles actually painted, not merely "the style parsed".
-       An inline style fires load instantly even when every tile is refused —
+       An inline style fires load instantly even when every tile is refused -
        that's how a blocked host ends up looking like a blank white map.
        (MapLibre v6 has no dataType:"tile" event, so ask the map directly.) */
     map.on("load", armPaintCheck);
@@ -477,7 +567,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
      after a failover. */
   /* Positive proof a tile really arrived: a 200 from this provider's own host.
      (transferSize/decodedBodySize are 0 cross-origin without Timing-Allow-Origin,
-     but responseStatus is exposed — 200 when a tile loads, 0 when it's refused.) */
+     but responseStatus is exposed - 200 when a tile loads, 0 when it's refused.) */
   function tilesArrived() {
     try {
       const host = TILE_PROVIDERS[providerIndex].host;
@@ -532,12 +622,12 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
     applyIndiaLock(map);
     renderMarkers();
     $("mapLoading").classList.add("hide");
-    console.info("[PandeMApp] basemap: " + TILE_PROVIDERS[providerIndex].label);
+    console.info("[EpideMApp] basemap: " + TILE_PROVIDERS[providerIndex].label);
     try { localStorage.setItem(TILE_STORE_KEY, TILE_PROVIDERS[providerIndex].id); } catch (e) { /* private mode */ }
     if (providerIndex > 0) {
       const forced = new URLSearchParams(location.search).get("tiles");
       if (!forced) {
-        toast("Default map tiles are blocked here — using " + TILE_PROVIDERS[providerIndex].label + " instead.", "info");
+        toast("Default map tiles are blocked here - using " + TILE_PROVIDERS[providerIndex].label + " instead.", "info");
       }
     }
     locateUser();
@@ -562,6 +652,23 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
       map.getSource("disease-areas").setData(circleData);
       circleDirty = false;
     }
+
+    // dashed outline for the radius filter
+    if (!map.getSource("radius-ring")) {
+      map.addSource("radius-ring", { type: "geojson", data: ringData });
+      map.addLayer({
+        id: "radius-ring-fill", type: "fill", source: "radius-ring",
+        paint: { "fill-color": "#1565D8", "fill-opacity": 0.05 }
+      });
+      map.addLayer({
+        id: "radius-ring-line", type: "line", source: "radius-ring",
+        paint: { "line-color": "#1565D8", "line-width": 2, "line-dasharray": [2, 2] }
+      });
+      ringDirty = false;
+    } else if (ringDirty) {
+      map.getSource("radius-ring").setData(ringData);
+      ringDirty = false;
+    }
   }
 
   /* Move to the next tile host. Called on 403/429 tile responses, on any error
@@ -582,7 +689,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
       el.innerHTML =
         '<div class="map-fallback">' +
         "<h3>Map tiles are blocked on this network</h3>" +
-        "<p>Every map provider we tried was refused. Reporting still works — " +
+        "<p>Every map provider we tried was refused. Reporting still works - " +
         "open a report and pick your location on the picker map.</p>" +
         '<button class="btn ghost" id="retryTilesBtn">Try the map again</button>' +
         "</div>";
@@ -597,12 +704,12 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
     providerIndex++;
     const to = TILE_PROVIDERS[providerIndex];
     try { localStorage.removeItem(TILE_STORE_KEY); } catch (e) { /* private mode */ }
-    console.warn("[PandeMApp] basemap " + from.id + " unusable (" + reason + ") → switching to " + to.id);
+    console.warn("[EpideMApp] basemap " + from.id + " unusable (" + reason + ") → switching to " + to.id);
     try {
       map.setStyle(styleFor(to));
       if (pickerMap) pickerMap.setStyle(styleFor(to));
     } catch (err) {
-      console.warn("[PandeMApp] setStyle failed:", err && err.message);
+      console.warn("[EpideMApp] setStyle failed:", err && err.message);
     }
     setCredit(to);
     setTimeout(() => {
@@ -635,6 +742,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
             )
           )
           .addTo(map);
+        if (radiusKm && $("radiusCenter").value === "me") applyRadius(true);
         renderStats();
       },
       () => { $("geoBanner").classList.add("show"); },
@@ -644,8 +752,24 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
 
   /* ================= markers ================= */
   function withinTimeWindow(report) {
+    const t = report.createdAt.getTime();
+    if (timeWindow === "custom") {
+      if (customFrom && t < customFrom) return false;
+      if (customTo && t > customTo) return false;
+      return true;
+    }
     if (!timeWindow) return true;
-    return Date.now() - report.createdAt.getTime() <= timeWindow * 86400000;
+    return Date.now() - t <= timeWindow * 86400000;
+  }
+
+  function withinRadius(report) {
+    if (!radiusKm || !radiusCentre) return true;
+    return haversine(radiusCentre.lat, radiusCentre.lng, report.lat, report.lng) <= radiusKm;
+  }
+
+  /* One test for every list the user sees: map pins, feed and counts. */
+  function passesFilters(report) {
+    return withinTimeWindow(report) && withinRadius(report);
   }
 
   function renderMarkers() {
@@ -656,7 +780,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
 
     const features = [];
     allReports
-      .filter((r) => visibleTypes.has(r.type) && withinTimeWindow(r))
+      .filter((r) => visibleTypes.has(r.type) && passesFilters(r))
       .forEach((r) => {
         const t = typeInfo(r.type);
         // Illness and animal-disease reports get a blurred disc so the exact
@@ -665,7 +789,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
         if (t.group === "illness" || t.group === "animal") features.push(circleFeature(r, 150, t.color));
 
         const popup = new maplibregl.Popup({ maxWidth: "260px", offset: 16 }).setHTML(popupHtml(r));
-        const marker = new maplibregl.Marker({ element: pinElement(r.type), anchor: "bottom" })
+        const marker = new maplibregl.Marker({ element: pinElement(r.type), anchor: "center" })
           .setLngLat([r.lng, r.lat])
           .setPopup(popup)
           .addTo(map);
@@ -678,7 +802,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
     ensureDiseaseLayers();
   }
 
-  /* MapLibre has no metre-based circle layer, so build a 150 m polygon — the
+  /* MapLibre has no metre-based circle layer, so build a 150 m polygon - the
      illness blur then stays accurate at every zoom level. */
   function circleFeature(r, radius, color) {
     const steps = 40;
@@ -709,6 +833,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
       '<div class="pop-meta">📍 ~' + dist + " away</div>" +
       (r.note ? '<div class="pop-note">' + escapeHtml(r.note) + "</div>" : "") +
       (photoUrl(r.photo) ? '<img class="pop-photo" data-photoid="' + r.id + '" src="' + photoUrl(r.photo) + '" alt="Photo attached to this report" />' : "") +
+      fileLinkHtml(r) +
       '<div class="pop-actions">' +
         (withdrawControl(r, mine).replace(/data-del=/, "data-withdraw=")) +
       "</div>"
@@ -743,9 +868,9 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
      doesn't work either: the India lock holds the map at a zoom where the frame
      cannot show the whole country, so panning north would drop Delhi from the
      count. The pins are drawn for every loaded report, so the bar counts the
-     same set the pins do — they can never disagree again. */
+     same set the pins do - they can never disagree again. */
   function countedReports() {
-    return allReports.filter(withinTimeWindow);
+    return allReports.filter(passesFilters);
   }
 
   function plural(n, one, many) { return n === 1 ? one : many; }
@@ -768,15 +893,24 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
     if ($("wordWater")) $("wordWater").textContent = plural(water, "water issue", "water issues");
     if ($("wordAnimal")) $("wordAnimal").textContent = plural(animal, "from animal", "from animals");
 
-    const range = timeWindow ? "last " + timeWindow + " days" : "all time";
-    $("barMeta").textContent = "Across India · " + range + " · " + nearby.length + " shown";
+    const where = radiusKm && radiusCentre ? "Within " + radiusKm + " km of " + radiusCentre.label : "Across India";
+    $("barMeta").textContent = where + " · " + timeRangeLabel() + " · " + nearby.length + " shown";
   }
 
   /* ================= feed ================= */
+  /* The feed can use its own age filter ("map" = follow the map's date filter). */
+  let feedAge = "map";
+  function feedPasses(r) {
+    if (feedAge === "map") return passesFilters(r);
+    const days = Number(feedAge);
+    if (days && Date.now() - r.createdAt.getTime() > days * 86400000) return false;
+    return withinRadius(r);
+  }
+
   function renderFeed() {
     const list = $("feedList");
     const ref = userLatLng || (map && map.getCenter());
-    const items = allReports.filter((r) => visibleTypes.has(r.type) && withinTimeWindow(r)).slice(0, 60);
+    const items = allReports.filter((r) => visibleTypes.has(r.type) && feedPasses(r)).slice(0, 60);
 
     $("feedCount").textContent = allReports.length
       ? items.length + " of " + allReports.length + " reports"
@@ -786,7 +920,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
       list.innerHTML =
         '<div class="empty-state"><span class="big">🗺️</span>' +
         (allReports.length
-          ? "No reports match your filters. Try widening the time range."
+          ? "No reports match your filters. Try widening the date range or the radius."
           : "No reports in your area yet. Be the first to flag a breeding site.") +
         "</div>";
       return;
@@ -796,7 +930,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
       .map((r) => {
         const t = typeInfo(r.type);
         const sev = (SEVERITY[t.category] || [])[Math.max(0, Math.min(2, r.severity - 1))] || "";
-        const dist = ref ? fmtDistance(haversine(ref.lat, ref.lng, r.lat, r.lng)) : "—";
+        const dist = ref ? fmtDistance(haversine(ref.lat, ref.lng, r.lat, r.lng)) : "-";
         const mine = r.userId === currentUserId();
         return (
           '<div class="feed-item" data-focus="' + r.id + '">' +
@@ -809,6 +943,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
               '<div class="f-meta">' + timeAgo(r.createdAt) + " · 📍 " + dist + " away" + (sev ? " · " + sev : "") + "</div>" +
               (r.note ? '<div class="f-note">' + escapeHtml(r.note) + "</div>" : "") +
               (photoUrl(r.photo) ? '<img class="f-photo" data-photoid="' + r.id + '" src="' + photoUrl(r.photo) + '" alt="Photo attached to this report" />' : "") +
+              fileLinkHtml(r) +
             "</div>" +
             '<div class="f-actions">' +
               '<button class="link-btn" data-goto="' + r.id + '">Show on map</button>' +
@@ -852,7 +987,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
       '<button class="chip on" data-group="' + keys.join(",") + '">' + icon + " " + label + "</button>";
 
     /* Three groups only. With twelve animal diseases on the map, a chip per type
-       would mean twenty-one chips — the legend carries the per-type detail instead. */
+       would mean twenty-one chips - the legend carries the per-type detail instead. */
     host.innerHTML = ["illness", "risk", "animal"]
       .map((g) => group(GROUPS[g].chip, GROUPS[g].icon, typeKeys(g)))
       .join("");
@@ -874,58 +1009,25 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
     });
   }
 
-  /* Three rows instead of eighteen entries. Each row shows the group's colours and
-     a live count, and opens to list the individual types. */
-  function buildLegend() {
-    const host = $("legendItems");
-    host.innerHTML = ["illness", "risk", "animal"]
-      .map((g) => {
-        const keys = typeKeys(g);
-        const dots = keys
-          .slice(0, 4)
-          .map((k) => '<i class="lg-dot" style="background:' + TYPES[k].color + '"></i>')
-          .join("");
-        const items = keys
-          .map((k) => {
-            const t = TYPES[k];
-            // a miniature of the actual pin: coloured marker with its emoji inside
-            return (
-              '<span class="lg-item"><span class="lg-pin" style="background:' + t.color + '">' +
-                "<i>" + t.icon + "</i></span>" + t.label + "</span>"
-            );
-          })
-          .join("");
-        return (
-          '<div class="lg-group">' +
-            '<button class="lg-head" data-lg-toggle="' + g + '">' +
-              '<span class="lg-caret">▸</span>' +
-              GROUPS[g].icon + " " + GROUPS[g].label +
-              '<span class="lg-dots">' + dots + "</span>" +
-              '<b class="lg-count" data-count="' + g + '">0</b>' +
-            "</button>" +
-            '<div class="lg-types" data-lg-body="' + g + '" hidden>' + items + "</div>" +
-          "</div>"
-        );
-      })
-      .join("");
+  /* Clean legend: three short groups, each a two-column list of colour dots.
+     Every animal-borne disease shares one colour, so that group is one line. */
+  function buildLegend() { updateLegendCounts(); }
 
-    host.addEventListener("click", (e) => {
-      const btn = e.target.closest("[data-lg-toggle]");
-      if (!btn) return;
-      const body = host.querySelector('[data-lg-body="' + btn.dataset.lgToggle + '"]');
-      if (!body) return;
-      const willOpen = body.hidden;
-      body.hidden = !willOpen;
-      btn.classList.toggle("open", willOpen);
-    });
-  }
-
-  /* Live counts next to each legend group, so the legend doubles as a tally. */
   function updateLegendCounts() {
-    ["illness", "risk", "animal"].forEach((g) => {
-      const el = document.querySelector('[data-count="' + g + '"]');
-      if (el) el.textContent = allReports.filter((r) => typeInfo(r.type).group === g).length;
-    });
+    const host = $("legendItems");
+    if (!host) return;
+    const dot = (color, label) =>
+      '<span class="lg-item"><i class="lg-dot" style="background:' + color + '"></i>' + escapeHtml(label) + "</span>";
+    host.innerHTML = ["illness", "risk", "animal"].map((g) => {
+      const total = allReports.filter((r) => typeInfo(r.type).group === g).length;
+      const items = g === "animal"
+        ? dot(ANIMAL_COLOR, "All animal-borne")
+        : typeKeys(g).map((k) => dot(TYPES[k].color, TYPES[k].label.replace("Japanese encephalitis", "Japanese enceph."))).join("");
+      return '<div class="lg-group">' +
+          '<div class="lg-head"><span>' + GROUPS[g].label + '</span><b class="lg-count">' + total + "</b></div>" +
+          '<div class="lg-types">' + items + "</div>" +
+        "</div>";
+    }).join("");
   }
 
   /* ================= report cards + modal ================= */
@@ -937,12 +1039,13 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
 
      Chikungunya, Japanese encephalitis and Zika are offered in the form even
      though they are not cards on the page. */
-  const DASHBOARD_ILLNESS = ["dengue", "malaria", "other_fever"];
-  const DASHBOARD_ANIMAL  = ["rabies", "nipah", "other_zoonotic"];
+  const DASHBOARD_ILLNESS = typeKeys("illness");
+  // Animal tab mirrors the Diseases tab: five common diseases plus an "Other" card.
+  // "Other" opens the animal form, where all twelve diseases can still be chosen.
+  const DASHBOARD_ANIMAL  = ["rabies", "nipah", "leptospirosis", "scrub_typhus", "swine_flu", "other_zoonotic"];
 
   const OTHER_CARDS = {
-    other_fever:    "See every mosquito-borne illness — chikungunya, Japanese encephalitis, Zika and others",
-    other_zoonotic: "See all twelve diseases that spread from animals"
+    other_zoonotic: "Bird flu, anthrax, plague, tick fevers and any other illness caught from animals"
   };
 
   function buildReportCards() {
@@ -974,21 +1077,28 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
     });
   }
 
-  function buildModalTypes() {
-    /* Only the mosquito/cleanliness types — the twelve animal diseases have their
-       own modal, opened from the 🐾 Animal-spread button. */
-    $("modalTypeGrid").innerHTML = typeKeys("illness").concat(typeKeys("risk"))
-      .map((k) => {
-        const t = TYPES[k];
-        return '<button class="type-opt" data-mtype="' + k + '"><span class="t-ic">' + t.icon + "</span>" + t.label + "</button>";
-      })
-      .join("");
+  let modalGroup = "illness";
 
+  function buildModalTypes() {
+    /* The grid is filled by fillModalTypes() each time the form opens, so a disease
+       report only offers diseases and a breeding-site report only offers sites.
+       The twelve animal diseases have their own modal. */
     $("modalTypeGrid").addEventListener("click", (e) => {
       const b = e.target.closest("[data-mtype]");
       if (!b) return;
       selectType(b.dataset.mtype);
     });
+  }
+
+  function fillModalTypes(group) {
+    modalGroup = group === "risk" ? "risk" : "illness";
+    $("modalTypeLabel").textContent = modalGroup === "risk" ? "What kind of breeding site?" : "Which disease?";
+    $("modalTypeGrid").innerHTML = typeKeys(modalGroup)
+      .map((k) => {
+        const t = TYPES[k];
+        return '<button class="type-opt" data-mtype="' + k + '"><span class="t-ic">' + t.icon + "</span>" + t.label + "</button>";
+      })
+      .join("");
   }
 
   function selectType(key) {
@@ -1002,6 +1112,8 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
     $("modalTitle").textContent = "Report: " + t.label;
     $("modalSub").textContent = t.blurb;
     $("photoHint").textContent = photoHintFor(t.group);
+    $("symptomBox").hidden = t.group !== "illness";   // symptoms: diseases only
+    $("siteBox").hidden = t.group !== "risk";          // site details: breeding sites only
     buildSeverity(t.category);
   }
 
@@ -1051,13 +1163,35 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
     $("locReadout").textContent = lat.toFixed(4) + ", " + lng.toFixed(4) + " ✓ pin placed";
   }
 
+  /* Breeding-site details: simple optional questions plus a free-text box. */
+  const SITE_FIELDS = [
+    { id: "siteSetting",  key: "siteSetting",  label: "Where" },
+    { id: "siteSince",    key: "siteSince",    label: "There for" },
+    { id: "siteInsects",  key: "siteInsects",  label: "Seen" },
+    { id: "siteReported", key: "siteReported", label: "Reported to local body" }
+  ];
+  function collectSite() {
+    const parts = [];
+    const extra = {};
+    SITE_FIELDS.forEach((f) => {
+      const el = $(f.id);
+      if (!el || !el.value) return;
+      extra[f.key] = el.value;
+      parts.push(f.label + ": " + el.options[el.selectedIndex].text);
+    });
+    const details = ($("siteDetails").value || "").trim().slice(0, 300);
+    if (details) { extra.siteDetails = details; parts.push(details); }
+    return { note: parts.join(" · "), extra };
+  }
+
   function openReportModal(typeKey) {
     ensurePickerMap();
     $("overlay").classList.add("show");
     $("reportModal").classList.add("show");
-    $("noteInput").value = "";
-    $("charCount").textContent = "0";
-    setPendingPhoto(null);            // never carry a photo into the next report
+    setPendingPhoto(null);            // never carry a file into the next report
+    fillModalTypes(typeInfo(typeKey || "stagnant_water").group);
+    if (illnessChecker) illnessChecker.reset();
+    SITE_FIELDS.forEach((f) => { const el = $(f.id); if (el) el.value = ""; });
     selectType(typeKey || "stagnant_water");
 
     setTimeout(() => {
@@ -1081,12 +1215,25 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
   async function submitReport() {
     if (!selectedType) { toast("Choose what you're reporting.", "error"); return; }
     if (!pendingCoords) { toast("Tap the mini-map to place your pin.", "error"); return; }
-
+    
     const t = typeInfo(selectedType);
+    // Blur the pin by up to 150 m before it is saved (was missing: "j" was undefined,
+    // so every disease / breeding-site submission crashed before reaching the database).
     const j = jitter(pendingCoords.lat, pendingCoords.lng, 150);
     const btn = $("submitReportBtn");
     btn.disabled = true;
-    btn.textContent = "Submitting…";
+    btn.textContent = "Submitting...";
+
+    const captured = t.group === "illness" && illnessChecker ? illnessChecker.collect()
+      : t.group === "risk" ? collectSite()
+      : { note: "", extra: {} };
+
+    if (t.group === "illness" && (!captured.extra.symptoms || captured.extra.symptoms.length === 0)) {
+      toast("Please tap at least one symptom.", "error");
+      btn.disabled = false;
+      btn.textContent = "Submit report";
+      return;
+    }
 
     const res = await Store.addReport({
       type: selectedType,
@@ -1094,9 +1241,10 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
       label: t.label,
       lat: j.lat,
       lng: j.lng,
-      note: $("noteInput").value.trim(),
+      note: captured.note,
       severity: selectedSeverity,
-      photo: pendingPhoto,
+      photo: imageOf(pendingPhoto),
+      extra: Object.assign({}, attachmentExtra(pendingPhoto), captured.extra),
       userId: currentUserId(),
       displayName: currentUser ? currentUser.displayName || "Signed-in user" : "Guest"
     });
@@ -1106,8 +1254,8 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
 
     if (res.savedTo === "firestore") {
       toast(res.photoDropped
-        ? "✅ Report added — the database rejected the photo, so it saved without one."
-        : "✅ Report added — it's live on the map.", "success");
+        ? "✅ Report added - the database rejected the file, so it saved without one."
+        : "✅ Report added - it's live on the map.", "success");
     } else {
       toast("⚠️ Saved on this device (cloud write blocked). See README to enable Firestore.", "error");
     }
@@ -1117,7 +1265,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
   }
 
   /* ================= animal-spread report modal =================
-     A second, purpose-built form on the same page — same map, same
+     A second, purpose-built form on the same page - same map, same
      storage, but its own diseases, its own exposure question and its
      own safety notice. Nothing opens in a new tab any more. */
   let aSelectedType = "";
@@ -1177,19 +1325,9 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
     $("animalRabiesAlert").hidden = !(aSelectedType === "rabies" || $("animalExposure").value === "bite");
   }
 
-  function setAnimalPhoto(dataUrl) {
-    aPhoto = dataUrl || null;
-    const img = $("animalPhotoPreviewImg"), box = $("animalPhotoPreview"), rm = $("animalPhotoRemoveBtn");
-    if (aPhoto) {
-      img.src = aPhoto;
-      box.hidden = false; rm.hidden = false;
-      $("animalPhotoPickBtn").textContent = "📷 Replace photo";
-    } else {
-      img.removeAttribute("src");
-      box.hidden = true; rm.hidden = true;
-      $("animalPhotoPickBtn").textContent = "📷 Add a photo";
-      $("animalPhotoInput").value = "";
-    }
+  function setAnimalPhoto(f) {
+    aPhoto = f || null;
+    paintFile(FILE_UI.animal, aPhoto);
   }
 
   function ensureAnimalPickerMap() {
@@ -1220,13 +1358,12 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
     ensureAnimalPickerMap();
     $("overlay").classList.add("show");
     $("animalModal").classList.add("show");
-    $("animalNoteInput").value = "";
-    $("animalCharCount").textContent = "0";
     setAnimalPhoto(null);
     aSeverity = 1;
     aCoords = null;
     if (aPickerMarker) { aPickerMarker.remove(); aPickerMarker = null; }
-    $("animalLocReadout").textContent = "No pin dropped yet — tap the map above.";
+    $("animalLocReadout").textContent = "No pin dropped yet - tap the map above.";
+    if (animalChecker) animalChecker.reset();
     selectAnimalType(typeInfo(typeKey).group === "animal" ? typeKey : "rabies");
 
     setTimeout(() => {
@@ -1250,31 +1387,42 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
     if (!$("animalExposure").value) { toast("Choose how you think it spread to you.", "error"); return; }
     if (!aCoords) { toast("Tap the mini-map to place your pin.", "error"); return; }
     if (aSaving) return;
-
+    
     const t = TYPES[aSelectedType];
     const j = jitter(aCoords.lat, aCoords.lng, 150);
     const btn = $("animalSubmitBtn");
     aSaving = true;
     btn.disabled = true;
-    btn.textContent = "Submitting…";
+    btn.textContent = "Submitting...";
+    
+    const animalCaptured = animalChecker ? animalChecker.collect() : { note: "", extra: {} };
+
+    // ADD THIS VALIDATION BLOCK:
+    if (!animalCaptured.extra.symptoms || animalCaptured.extra.symptoms.length === 0) {
+      toast("Please tap at least one symptom.", "error");
+      aSaving = false;
+      btn.disabled = false;
+      btn.textContent = "Submit report";
+      return;
+    }
 
     const res = await Store.addReport({
       type: aSelectedType,
-      category: t.category,          // stays "disease" — the rules reject anything else
+      category: t.category,          // stays "disease" - the rules reject anything else
       label: t.label,
       lat: j.lat,
       lng: j.lng,
-      note: $("animalNoteInput").value.trim(),
+      note: animalCaptured.note,
       severity: aSeverity,
-      photo: aPhoto,
+      photo: imageOf(aPhoto),
       userId: currentUserId(),
       displayName: currentUser ? currentUser.displayName || "Signed-in user" : "Guest",
-      extra: {
+      extra: Object.assign({
         track: "zoonotic",
         exposure: $("animalExposure").value,
         exposureLabel: ZOONOTIC_EXPOSURE[$("animalExposure").value],
         onsetDate: ""
-      }
+      }, attachmentExtra(aPhoto), animalCaptured.extra)
     });
 
     aSaving = false;
@@ -1283,14 +1431,882 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
 
     if (res.savedTo === "firestore") {
       toast(res.photoDropped
-        ? "✅ Report added — the database rejected the photo, so it saved without one."
-        : "✅ Report added — it's live on the map.", "success");
+        ? "✅ Report added - the database rejected the file, so it saved without one."
+        : "✅ Report added - it's live on the map.", "success");
     } else {
       toast("⚠️ Saved on this device (cloud write blocked). See README to enable Firestore.", "error");
     }
 
     closeAnimalModal();
     setTimeout(() => focusReport(res.id), 250);
+  }
+
+  /* ================= file inputs (image or small PDF) ================= */
+  function wireFileInput(ui, setter, getter) {
+    $(ui.pick).addEventListener("click", () => $(ui.input).click());
+    $(ui.rm).addEventListener("click", () => setter(null));
+    $(ui.input).addEventListener("change", async (e) => {
+      const file = e.target.files && e.target.files[0];
+      if (!file) return;
+      const btn = $(ui.pick);
+      btn.disabled = true;
+      btn.textContent = "⏳ Processing…";
+      try {
+        const f = await prepareFile(file);
+        setter(f);
+        toast("File ready - " + fileKb(f) + " KB.", "success");
+      } catch (err) {
+        toast(err && err.message ? err.message : "Could not read that file.", "error");
+        paintFile(ui, getter());          // keep whatever was attached before
+        $(ui.input).value = "";
+      }
+      btn.disabled = false;
+    });
+  }
+
+  function wireFileInputs() {
+    wireFileInput(FILE_UI.main, setPendingPhoto, () => pendingPhoto);
+    wireFileInput(FILE_UI.animal, setAnimalPhoto, () => aPhoto);
+  }
+
+  /* ================= date filter ================= */
+  function pad2(n) { return (n < 10 ? "0" : "") + n; }
+  function ymd(d) { return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()); }
+
+  function timeRangeLabel() {
+    if (timeWindow === "custom") {
+      const f = $("dateFrom").value, t = $("dateTo").value;
+      if (f && t) return f + " to " + t;
+      if (f) return "from " + f;
+      if (t) return "until " + t;
+      return "all dates";
+    }
+    return timeWindow ? "last " + timeWindow + " days" : "all time";
+  }
+
+  function readCustomDates() {
+    const f = $("dateFrom").value, t = $("dateTo").value;
+    customFrom = f ? new Date(f + "T00:00:00").getTime() : 0;
+    customTo = t ? new Date(t + "T23:59:59.999").getTime() : 0;
+  }
+
+  function refreshFiltered() {
+    renderMarkers();
+    renderFeed();
+    renderStats();
+  }
+
+  function wireDateFilter() {
+    const sel = $("timeSelect"), box = $("dateRange"), from = $("dateFrom"), to = $("dateTo");
+    from.max = to.max = ymd(new Date());
+
+    sel.addEventListener("change", () => {
+      if (sel.value === "custom") {
+        timeWindow = "custom";
+        box.hidden = false;
+        if (!from.value && !to.value) {
+          const d = new Date();
+          d.setDate(d.getDate() - 10);
+          from.value = ymd(d);
+          to.value = ymd(new Date());
+        }
+        readCustomDates();
+      } else {
+        timeWindow = Number(sel.value);
+        box.hidden = true;
+      }
+      refreshFiltered();
+    });
+
+    function onDate() {
+      if (from.value && to.value && from.value > to.value) {
+        toast("The start date is after the end date.", "error");
+        return;
+      }
+      readCustomDates();
+      refreshFiltered();
+    }
+    from.addEventListener("change", onDate);
+    to.addEventListener("change", onDate);
+  }
+
+  /* ================= radius filter =================
+     The centre is fixed at the moment the radius is chosen, so panning the map
+     afterwards doesn't silently change which reports count. */
+  function radiusCentreFromUI() {
+    const mode = $("radiusCenter").value;
+    if (mode === "city" && searchedCity) return { lat: searchedCity.lat, lng: searchedCity.lng, label: searchedCity.name };
+    if (mode === "me") {
+      return userLatLng ? { lat: userLatLng.lat, lng: userLatLng.lng, label: "your location" } : null;
+    }
+    if (map) {
+      const c = map.getCenter();
+      return { lat: c.lat, lng: c.lng, label: "the map centre" };
+    }
+    return null;
+  }
+
+  function fitRadius() {
+    if (!map || !radiusCentre) return;
+    const c = radiusCentre;
+    const dLat = radiusKm / 111.32;
+    const dLng = radiusKm / (111.32 * Math.cos((c.lat * Math.PI) / 180));
+    try {
+      map.fitBounds([[c.lng - dLng, c.lat - dLat], [c.lng + dLng, c.lat + dLat]], { padding: 40, maxZoom: 15 });
+    } catch (e) { /* map not ready */ }
+  }
+
+  function applyRadius(silent) {
+    radiusKm = Number($("radiusSelect").value) || 0;
+    radiusCentre = null;
+    if (radiusKm) {
+      radiusCentre = radiusCentreFromUI();
+      if (!radiusCentre) {
+        if (!silent) toast("Your location isn't available - measuring from the centre of the map instead.", "info");
+        $("radiusCenter").value = "map";
+        radiusCentre = radiusCentreFromUI();
+      }
+    }
+    ringData = radiusCentre
+      ? { type: "FeatureCollection", features: [circleFeature(radiusCentre, radiusKm * 1000, "#1565D8")] }
+      : { type: "FeatureCollection", features: [] };
+    ringDirty = true;
+    ensureDiseaseLayers();
+    $("radiusNote").textContent = radiusCentre
+      ? "Showing reports within " + radiusKm + " km of " + radiusCentre.label + "."
+      : "";
+    if (radiusCentre && !silent) fitRadius();
+    refreshFiltered();
+  }
+
+  function wireRadius() {
+    $("radiusSelect").addEventListener("change", () => applyRadius());
+    $("radiusCenter").addEventListener("change", () => applyRadius());
+  }
+
+  /* ================= reporting tabs ================= */
+  function showReportTab(name, focus) {
+    const tabs = Array.from(document.querySelectorAll("#reportTabs .tab"));
+    tabs.forEach((t) => {
+      const on = t.dataset.tab === name;
+      t.classList.toggle("on", on);
+      t.setAttribute("aria-selected", on ? "true" : "false");
+      t.tabIndex = on ? 0 : -1;
+      if (on && focus) t.focus();
+    });
+    document.querySelectorAll("[data-panel]").forEach((p) => { p.hidden = p.dataset.panel !== name; });
+  }
+
+  function wireReportTabs() {
+    const bar = $("reportTabs");
+    if (!bar) return;
+    bar.addEventListener("click", (e) => {
+      const t = e.target.closest(".tab");
+      if (t) showReportTab(t.dataset.tab);
+    });
+    bar.addEventListener("keydown", (e) => {
+      if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
+      const tabs = Array.from(bar.querySelectorAll(".tab"));
+      const i = tabs.findIndex((t) => t.classList.contains("on"));
+      const next = tabs[(i + (e.key === "ArrowRight" ? 1 : tabs.length - 1)) % tabs.length];
+      showReportTab(next.dataset.tab, true);
+      e.preventDefault();
+    });
+    showReportTab("illness");
+  }
+
+  /* ================= symptom checker =================
+     General information only. It scores the ticked symptoms against a short profile
+     of each reportable disease and offers the closest ones as a starting point for
+     the report. It never diagnoses, and the form says so. Warning signs always
+     point the person to a doctor first. */
+  const SYMPTOMS = {
+    fever: "Fever", chills: "Chills / shivering", sweats: "Heavy sweating", headache: "Headache",
+    eye_pain: "Pain behind the eyes", joint_pain: "Joint pain", muscle_pain: "Muscle / body ache",
+    rash: "Skin rash", red_eyes: "Red eyes", nausea: "Nausea / vomiting", fatigue: "Extreme tiredness",
+    cough: "Cough", sore_throat: "Sore throat / runny nose", breathless: "Difficulty breathing",
+    confusion: "Confusion or drowsiness", seizures: "Seizures / fits", stiff_neck: "Stiff neck",
+    bleeding: "Bleeding or bruising", abdo_pain: "Severe stomach pain", jaundice: "Yellow skin or eyes",
+    swollen_nodes: "Swollen, tender lumps (glands)", black_sore: "Painless black sore or scab",
+    bite: "Animal bite or scratch", tick_bite: "Tick or mite bite", swallowing: "Trouble swallowing / fear of water",
+    tingling: "Tingling or pain at a bite wound", anxiety: "Agitation or anxiety"
+  };
+
+  /* Symptoms that should send someone to a doctor today. */
+  const DANGER_SYMPTOMS = new Set(["breathless", "confusion", "seizures", "stiff_neck", "bleeding", "abdo_pain", "swallowing", "jaundice"]);
+
+  const DISEASE_SYMPTOMS = {
+    dengue:        ["fever", "headache", "eye_pain", "joint_pain", "muscle_pain", "rash", "nausea", "bleeding", "abdo_pain"],
+    malaria:       ["fever", "chills", "sweats", "headache", "nausea", "muscle_pain", "fatigue"],
+    chikungunya:   ["fever", "joint_pain", "rash", "headache", "muscle_pain", "fatigue"],
+    jp_enceph:     ["fever", "headache", "nausea", "confusion", "seizures", "stiff_neck"],
+    zika:          ["fever", "rash", "red_eyes", "joint_pain", "headache"],
+    other_fever:   ["fever"],
+    rabies:        ["bite", "tingling", "fever", "anxiety", "swallowing", "confusion", "headache"],
+    nipah:         ["fever", "headache", "confusion", "cough", "breathless", "nausea", "seizures", "muscle_pain"],
+    leptospirosis: ["fever", "muscle_pain", "red_eyes", "headache", "jaundice", "nausea", "chills"],
+    anthrax:       ["black_sore", "fever", "cough", "breathless", "nausea"],
+    brucellosis:   ["fever", "sweats", "joint_pain", "fatigue", "muscle_pain", "headache"],
+    plague:        ["fever", "swollen_nodes", "chills", "fatigue", "cough"],
+    kyasanur:      ["fever", "headache", "muscle_pain", "bleeding", "nausea", "tick_bite"],
+    cchf:          ["fever", "bleeding", "headache", "muscle_pain", "nausea", "tick_bite", "abdo_pain"],
+    avian_flu:     ["fever", "cough", "breathless", "sore_throat", "muscle_pain"],
+    swine_flu:     ["fever", "cough", "sore_throat", "muscle_pain", "headache", "fatigue"],
+    scrub_typhus:  ["fever", "black_sore", "headache", "rash", "muscle_pain", "tick_bite", "cough"]
+  };
+
+  // Short lists: the most common symptoms only. Anything else goes in "Other symptom".
+  const ILLNESS_SYMPTOM_LIST = ["fever", "chills", "headache", "joint_pain", "muscle_pain", "rash",
+    "eye_pain", "nausea", "fatigue", "bleeding", "confusion", "abdo_pain"];
+  const ANIMAL_SYMPTOM_LIST = ["fever", "headache", "muscle_pain", "cough", "breathless", "jaundice",
+    "rash", "confusion", "bleeding", "bite", "tick_bite", "swallowing"];
+
+  let illnessChecker = null;
+  let animalChecker = null;
+  let habitatChecker = null;
+
+  function makeSymptomChecker(cfg) {
+    const selected = new Set();
+    const grid = $(cfg.grid), danger = $(cfg.danger), result = $(cfg.result);
+    const ex = cfg.extras || {};   // ids of the duration / people / other-symptom fields
+
+    function optText(id) {
+      const el = $(id);
+      return el && el.value ? el.options[el.selectedIndex].text : "";
+    }
+    function resetExtras() {
+      Object.keys(ex).forEach((k) => { const el = $(ex[k]); if (el) el.value = ""; });
+    }
+
+    function render() {
+      grid.innerHTML = cfg.symptoms
+        .map((k) =>
+          '<button type="button" class="sym-chip' + (DANGER_SYMPTOMS.has(k) ? " warn" : "") +
+          (selected.has(k) ? " on" : "") + '" data-sym="' + k + '" aria-pressed="' + selected.has(k) + '">' +
+          SYMPTOMS[k] + "</button>")
+        .join("");
+    }
+
+    function update() {
+      const sel = Array.from(selected);
+
+      const msgs = [];
+      if (sel.some((k) => DANGER_SYMPTOMS.has(k))) {
+        msgs.push("<strong>Some of these can be warning signs.</strong> Please see a doctor or go to a hospital today. Filing a report does not replace medical care.");
+      }
+      if (selected.has("bite")) {
+        msgs.push("<strong>After an animal bite or scratch</strong>, wash the wound with soap and running water for 15 minutes and go to a hospital or clinic today to ask about rabies vaccination.");
+      }
+      danger.innerHTML = msgs.map((m) => "<div>" + m + "</div>").join("");
+      danger.hidden = !msgs.length;
+      if (!cfg.suggest) { result.innerHTML = ""; return; }   // data collection only - no "closest match" list
+
+      if (!sel.length) {
+        result.innerHTML = '<div class="sym-empty">Tick the symptoms the patient has to see which report type is the closest match.</div>';
+        return;
+      }
+
+      const scored = cfg.candidates()
+        .map((k) => {
+          const profile = DISEASE_SYMPTOMS[k] || [];
+          const matched = sel.filter((x) => profile.indexOf(x) >= 0).length;
+          const precision = matched / sel.length;          // how much of what was ticked it explains
+          const recall = profile.length ? matched / profile.length : 0;   // how much of its usual picture was ticked
+          const score = matched ? (2 * precision * recall) / (precision + recall) : 0;
+          return { k: k, matched: matched, score: score };
+        })
+        .filter((x) => x.matched > 0)
+        .sort((a, b) => b.score - a.score || b.matched - a.matched)
+        .slice(0, 3);
+
+      if (!scored.length) {
+        result.innerHTML = '<div class="sym-empty">None of the listed conditions is a close match. You can still pick one above, or choose the “other” option.</div>';
+        return;
+      }
+
+      result.innerHTML =
+        '<div class="sym-empty">Closest matches to report - not a diagnosis:</div>' +
+        scored.map((x) => {
+          const t = TYPES[x.k];
+          return (
+            '<div class="sym-hit"><span>' + t.icon + '</span>' +
+            '<span class="s-name">' + escapeHtml(t.label) +
+              "<small>Matches " + x.matched + " of your " + sel.length + " symptom" + (sel.length === 1 ? "" : "s") + "</small></span>" +
+            '<button type="button" class="btn btn-ghost" data-sym-pick="' + x.k + '">Use this</button></div>'
+          );
+        }).join("");
+    }
+
+    grid.addEventListener("click", (e) => {
+      const b = e.target.closest("[data-sym]");
+      if (!b) return;
+      const k = b.dataset.sym;
+      if (selected.has(k)) selected.delete(k); else selected.add(k);
+      b.classList.toggle("on", selected.has(k));
+      b.setAttribute("aria-pressed", selected.has(k) ? "true" : "false");
+      update();
+    });
+
+    result.addEventListener("click", (e) => {
+      const b = e.target.closest("[data-sym-pick]");
+      if (!b) return;
+      cfg.onPick(b.dataset.symPick);
+      toast("Selected " + TYPES[b.dataset.symPick].label + " - change it above if it isn't right.", "info");
+    });
+
+    return {
+      reset: function () { selected.clear(); render(); update(); resetExtras(); },
+
+      /* What gets saved with the report: structured fields in `extra`, and a
+         readable summary in `note` so the map popups and feed still show it. */
+      collect: function () {
+        const keys = cfg.symptoms.filter((k) => selected.has(k));
+        const duration = $(ex.duration) ? $(ex.duration).value : "";
+        const sexAtBirth = $(ex.sexAtBirth) ? $(ex.sexAtBirth).value : "";
+        const people = $(ex.people) ? $(ex.people).value : "";
+        const lifeStage = $(ex.lifeStage) ? $(ex.lifeStage).value : "";
+        const traveled = $(ex.traveled) ? $(ex.traveled).value : "";
+        const contactSick = $(ex.contactSick) ? $(ex.contactSick).value : "";
+        const allergies = $(ex.allergies) ? $(ex.allergies).value : "";
+        const confused = $(ex.confused) ? $(ex.confused).value : "";
+        const other = $(ex.other) ? $(ex.other).value.trim() : "";
+        
+        const parts = [];
+        if (keys.length) parts.push("Symptoms: " + keys.map((k) => SYMPTOMS[k]).join(", "));
+        if (duration) parts.push("Lasting: " + optText(ex.duration));
+        if (sexAtBirth) parts.push("Sex at birth: " + optText(ex.sexAtBirth));
+        if (people) parts.push("People affected: " + optText(ex.people));
+        if (lifeStage) parts.push("Life Stage: " + optText(ex.lifeStage));
+        if (traveled) parts.push("Recent Travel: " + optText(ex.traveled));
+        if (contactSick) parts.push("Contact with Sick: " + optText(ex.contactSick));
+        if (allergies) parts.push("Allergies: " + optText(ex.allergies));
+        if (confused) parts.push("Confused/Drowsy: " + optText(ex.confused));
+        if (other) parts.push("Other: " + other);
+        
+        const extra = {};
+        if (keys.length) extra.symptoms = keys;
+        if (duration) extra.symptomDuration = duration;
+        if (sexAtBirth) extra.patientSexAtBirth = sexAtBirth;
+        if (people) extra.symptomPeople = people;
+        if (lifeStage) extra.symptomLifeStage = lifeStage;
+        if (traveled) extra.symptomTraveled = traveled;
+        if (contactSick) extra.symptomContactSick = contactSick;
+        if (allergies) extra.symptomAllergies = allergies;
+        if (confused) extra.symptomConfused = confused;
+        if (other) extra.otherSymptoms = other;
+        
+        return { note: parts.join(". ").slice(0, 400), extra: extra };
+      }
+    };
+  }
+
+
+  /* ================= habitat checker (breeding sites) =================
+     Only asks about the site itself: where it is, the water, its size, how long it
+     has been like that, and any signs of breeding. The follow-up list changes with
+     the type of site chosen. The risk line is indicative only. */
+  const HABITAT_COMMON = [
+    { key: "setting", label: "Where is the site?", options: [
+      ["open_plot", "Open plot / vacant land"], ["roadside", "Roadside / street"], ["residential", "Homes / lane"],
+      ["rooftop", "Rooftop / terrace"], ["construction", "Construction site"], ["public", "Market / park / public place"]] },
+    { key: "water", label: "Is there standing water?", options: [
+      ["yes", "Yes"], ["no", "No"], ["unsure", "Not sure"]] },
+    { key: "clarity", label: "What does the water look like?", options: [
+      ["clear", "Clear"], ["cloudy", "Cloudy"], ["dirty", "Dirty / foul smell"], ["algae", "Green / algae"]] },
+    { key: "size", label: "How big is the site?", options: [
+      ["small", "Small (bucket, tyre, pot)"], ["medium", "Medium (puddle, tank, drain stretch)"], ["large", "Large (pond, plot, long stretch)"]] },
+    { key: "age", label: "How long has it been like this?", options: [
+      ["lt3", "Under 3 days"], ["3to7", "3-7 days"], ["gt7", "Over a week"], ["unknown", "Don't know"]] },
+    { key: "signs", label: "Signs of mosquito breeding", multi: true, options: [
+      ["larvae", "Wriggling larvae in the water"], ["adults", "Many mosquitoes around"],
+      ["bites", "People bitten nearby"], ["none", "None seen"]] }
+  ];
+
+  const HABITAT_FEATURES = {
+    stagnant_water: { label: "What is holding the water?", options: [
+      ["containers", "Open buckets / containers"], ["tyres", "Old tyres"], ["tanks", "Uncovered tank / cooler"],
+      ["pits", "Pits / potholes"], ["pots", "Plant pots / trays"], ["gutter", "Blocked roof gutter"]] },
+    drainage: { label: "What is wrong with the drain?", options: [
+      ["blocked", "Blocked drain"], ["overflow", "Sewage overflow"], ["open", "Open / uncovered drain"],
+      ["broken", "Broken pipe"], ["slow", "Water barely moving"]] },
+    garbage: { label: "What is in the waste?", options: [
+      ["cans", "Cans, bottles, plastic cups"], ["tyres", "Old tyres"], ["coconut", "Coconut shells"],
+      ["heap", "Large uncollected heap"], ["rainwater", "Rainwater collecting in it"]] }
+  };
+  const HABITAT_SHARED_FEATURES = [["weeds", "Thick plants or weeds nearby"], ["shade", "Shaded spot"]];
+  const HABITAT_SHORT = { setting: "Setting", water: "Standing water", clarity: "Water", size: "Size",
+    age: "Present for", signs: "Signs", features: "Features" };
+
+  function makeHabitatChecker() {
+    const host = $("habitatQuestions"), result = $("habitatResult");
+    let answers = {};                 // question key -> string, or array for multi-select
+    let siteType = "stagnant_water";
+
+    function questions() {
+      const f = HABITAT_FEATURES[siteType] || HABITAT_FEATURES.stagnant_water;
+      return HABITAT_COMMON.concat([{ key: "features", label: f.label, multi: true, options: f.options.concat(HABITAT_SHARED_FEATURES) }]);
+    }
+
+    function isOn(q, v) {
+      const a = answers[q.key];
+      return q.multi ? Array.isArray(a) && a.indexOf(v) >= 0 : a === v;
+    }
+
+    function render() {
+      if (!host) return;
+      host.innerHTML = questions().map((q) =>
+        '<div class="hab-q"><label>' + q.label + (q.multi ? ' <span class="opt">(tick all that apply)</span>' : "") +
+        '</label><div class="sym-grid">' +
+        q.options.map((o) =>
+          '<button type="button" class="sym-chip' + (isOn(q, o[0]) ? " on" : "") + '" data-hq="' + q.key +
+          '" data-hv="' + o[0] + '" aria-pressed="' + isOn(q, o[0]) + '">' + o[1] + "</button>").join("") +
+        "</div></div>").join("");
+    }
+
+    function paint() {
+      const qs = questions();
+      host.querySelectorAll("[data-hq]").forEach((b) => {
+        const q = qs.find((x) => x.key === b.dataset.hq);
+        const on = !!q && isOn(q, b.dataset.hv);
+        b.classList.toggle("on", on);
+        b.setAttribute("aria-pressed", on ? "true" : "false");
+      });
+    }
+
+    /* Indicative only: standing water, larvae, age and size push it up. */
+    function risk() {
+      let s = 0;
+      const signs = answers.signs || [];
+      if (answers.water === "yes") s += 2; else if (answers.water === "unsure") s += 1;
+      if (signs.indexOf("larvae") >= 0) s += 3;
+      if (signs.indexOf("adults") >= 0) s += 1;
+      if (signs.indexOf("bites") >= 0) s += 1;
+      if (answers.age === "gt7") s += 2; else if (answers.age === "3to7") s += 1;
+      if (answers.size === "large") s += 2; else if (answers.size === "medium") s += 1;
+      if ((answers.features || []).length >= 2) s += 1;
+      return s >= 7 ? "high" : s >= 4 ? "moderate" : "low";
+    }
+
+    function update() {
+      if (!result) return;
+      if (!Object.keys(answers).length) {
+        result.innerHTML = '<div class="sym-empty">Answer a few questions above to see how likely this site is to breed mosquitoes.</div>';
+        return;
+      }
+      const lvl = risk();
+      const text = {
+        low: "Few signs so far. Add anything else you can see.",
+        moderate: "Standing water can become a breeding spot within days, so it is worth reporting.",
+        high: "Larvae, or water that has stood for a long time, make this a likely breeding site. Reporting it helps get it cleared."
+      };
+      result.innerHTML = '<div class="hab-level ' + lvl + '"><strong>Breeding risk looks ' + lvl + "</strong><span>" + text[lvl] + "</span></div>";
+    }
+
+    if (host) {
+      host.addEventListener("click", (e) => {
+        const b = e.target.closest("[data-hq]");
+        if (!b) return;
+        const k = b.dataset.hq, v = b.dataset.hv;
+        const q = questions().find((x) => x.key === k);
+        if (!q) return;
+        if (q.multi) {
+          let a = Array.isArray(answers[k]) ? answers[k].slice() : [];
+          if (a.indexOf(v) >= 0) a = a.filter((x) => x !== v);
+          else if (k === "signs") a = v === "none" ? ["none"] : a.filter((x) => x !== "none").concat(v);
+          else a.push(v);
+          if (a.length) answers[k] = a; else delete answers[k];
+        } else if (answers[k] === v) {
+          delete answers[k];                 // tap again to clear
+        } else {
+          answers[k] = v;
+        }
+        paint();
+        update();
+      });
+    }
+
+    return {
+      reset: function () { answers = {}; render(); update(); },
+
+      /* The list of follow-up options depends on the kind of site. */
+      setType: function (key) {
+        siteType = HABITAT_FEATURES[key] ? key : "stagnant_water";
+        const valid = questions().find((q) => q.key === "features").options.map((o) => o[0]);
+        if (answers.features) {
+          answers.features = answers.features.filter((v) => valid.indexOf(v) >= 0);
+          if (!answers.features.length) delete answers.features;
+        }
+        render();
+        update();
+      },
+
+      collect: function () {
+        const habitat = {}, parts = [];
+        questions().forEach((q) => {
+          const a = answers[q.key];
+          if (a === undefined) return;
+          habitat[q.key] = a;
+          const labelOf = (v) => (q.options.find((o) => o[0] === v) || [v, v])[1];
+          parts.push(HABITAT_SHORT[q.key] + ": " + (Array.isArray(a) ? a.map(labelOf).join(", ") : labelOf(a)));
+        });
+        const has = Object.keys(habitat).length > 0;
+        return {
+          note: has ? ("Habitat - " + parts.join("; ")).slice(0, 400) : "",
+          extra: has ? { habitat: habitat, habitatRisk: risk() } : {}
+        };
+      }
+    };
+  }
+
+  function wireSymptomCheckers() {
+    illnessChecker = makeSymptomChecker({
+      grid: "symptomGrid", danger: "symptomDanger", result: "symptomResult",
+      symptoms: ILLNESS_SYMPTOM_LIST,
+      // UPDATE THIS LINE to include your new fields:
+      extras: { 
+        duration: "symptomDuration", 
+        sexAtBirth: "patientSexAtBirth",
+        lifeStage: "symptomLifeStage",
+        other: "symptomOther" 
+      },
+      candidates: () => typeKeys("illness"),
+      onPick: (k) => selectType(k)
+    });
+    // Symptom checker inside the animal-borne disease form
+    animalChecker = makeSymptomChecker({
+      grid: "animalSymptomGrid", danger: "animalSymptomDanger", result: "animalSymptomResult",
+      symptoms: ANIMAL_SYMPTOM_LIST,
+      extras: {
+        duration: "animalSymptomDuration",
+        people: "animalSymptomPeople",
+        other: "animalSymptomOther"
+      },
+      candidates: () => typeKeys("animal"),
+      onPick: (k) => selectAnimalType(k)
+    });
+    illnessChecker.reset();
+    animalChecker.reset();
+  }
+
+  /* ================= services: city outbreak check =================
+     A built-in list of major Indian cities works instantly and offline. Anything
+     else is looked up on OpenStreetMap's Nominatim, limited to India. */
+  const CITIES = [
+    ["Delhi", "Delhi", 28.61, 77.21], ["Mumbai", "Maharashtra", 19.08, 72.88], ["Kolkata", "West Bengal", 22.57, 88.36],
+    ["Chennai", "Tamil Nadu", 13.08, 80.27], ["Bengaluru", "Karnataka", 12.97, 77.59], ["Hyderabad", "Telangana", 17.39, 78.49],
+    ["Ahmedabad", "Gujarat", 23.02, 72.57], ["Pune", "Maharashtra", 18.52, 73.86], ["Jaipur", "Rajasthan", 26.91, 75.79],
+    ["Lucknow", "Uttar Pradesh", 26.85, 80.95], ["Kanpur", "Uttar Pradesh", 26.45, 80.35], ["Nagpur", "Maharashtra", 21.15, 79.09],
+    ["Indore", "Madhya Pradesh", 22.72, 75.86], ["Bhopal", "Madhya Pradesh", 23.26, 77.41], ["Patna", "Bihar", 25.59, 85.14],
+    ["Surat", "Gujarat", 21.17, 72.83], ["Vadodara", "Gujarat", 22.31, 73.18], ["Rajkot", "Gujarat", 22.30, 70.80],
+    ["Visakhapatnam", "Andhra Pradesh", 17.69, 83.22], ["Vijayawada", "Andhra Pradesh", 16.51, 80.65], ["Warangal", "Telangana", 17.97, 79.60],
+    ["Coimbatore", "Tamil Nadu", 11.02, 76.96], ["Madurai", "Tamil Nadu", 9.92, 78.12], ["Tiruchirappalli", "Tamil Nadu", 10.79, 78.70],
+    ["Puducherry", "Puducherry", 11.93, 79.83], ["Kochi", "Kerala", 9.93, 76.27], ["Thiruvananthapuram", "Kerala", 8.52, 76.94],
+    ["Kozhikode", "Kerala", 11.26, 75.78], ["Thrissur", "Kerala", 10.53, 76.21], ["Mysuru", "Karnataka", 12.30, 76.64],
+    ["Mangaluru", "Karnataka", 12.91, 74.86], ["Chandigarh", "Chandigarh", 30.73, 76.78], ["Amritsar", "Punjab", 31.63, 74.87],
+    ["Ludhiana", "Punjab", 30.90, 75.86], ["Dehradun", "Uttarakhand", 30.32, 78.03], ["Shimla", "Himachal Pradesh", 31.10, 77.17],
+    ["Srinagar", "Jammu & Kashmir", 34.08, 74.80], ["Jammu", "Jammu & Kashmir", 32.73, 74.86], ["Ghaziabad", "Uttar Pradesh", 28.67, 77.45],
+    ["Noida", "Uttar Pradesh", 28.54, 77.39], ["Gurugram", "Haryana", 28.46, 77.03], ["Faridabad", "Haryana", 28.41, 77.31],
+    ["Meerut", "Uttar Pradesh", 28.98, 77.71], ["Agra", "Uttar Pradesh", 27.18, 78.01], ["Varanasi", "Uttar Pradesh", 25.32, 82.97],
+    ["Prayagraj", "Uttar Pradesh", 25.44, 81.85], ["Gorakhpur", "Uttar Pradesh", 26.76, 83.37], ["Jodhpur", "Rajasthan", 26.24, 73.02],
+    ["Udaipur", "Rajasthan", 24.59, 73.71], ["Nashik", "Maharashtra", 19.99, 73.79], ["Aurangabad", "Maharashtra", 19.88, 75.34],
+    ["Jabalpur", "Madhya Pradesh", 23.18, 79.95], ["Gwalior", "Madhya Pradesh", 26.22, 78.18], ["Raipur", "Chhattisgarh", 21.25, 81.63],
+    ["Ranchi", "Jharkhand", 23.34, 85.31], ["Jamshedpur", "Jharkhand", 22.80, 86.20], ["Dhanbad", "Jharkhand", 23.80, 86.43],
+    ["Bhubaneswar", "Odisha", 20.30, 85.82], ["Guwahati", "Assam", 26.14, 91.74], ["Siliguri", "West Bengal", 26.73, 88.40],
+    ["Shillong", "Meghalaya", 25.58, 91.89], ["Imphal", "Manipur", 24.82, 93.94], ["Panaji", "Goa", 15.50, 73.83]
+  ];
+
+  const CITY_ALIASES = {
+    "new delhi": "Delhi", "bangalore": "Bengaluru", "bombay": "Mumbai", "calcutta": "Kolkata", "madras": "Chennai",
+    "trivandrum": "Thiruvananthapuram", "gurgaon": "Gurugram", "mysore": "Mysuru", "cochin": "Kochi",
+    "allahabad": "Prayagraj", "vizag": "Visakhapatnam", "baroda": "Vadodara", "banaras": "Varanasi",
+    "benares": "Varanasi", "pondicherry": "Puducherry", "calicut": "Kozhikode", "panjim": "Panaji",
+    "trichy": "Tiruchirappalli", "mangalore": "Mangaluru"
+  };
+
+  const QUICK_CITIES = ["Delhi", "Mumbai", "Kolkata", "Chennai", "Bengaluru", "Hyderabad"];
+
+  let svcCity = null;
+  let svcKm = 25;
+  let svcDays = 30;
+
+  function cityEntry(c) { return { name: c[0], sub: c[1], lat: c[2], lng: c[3] }; }
+
+  function findCity(q) {
+    const key = q.trim().toLowerCase().replace(/\s+/g, " ").replace(/,.*$/, "");
+    const canon = (CITY_ALIASES[key] || key).toLowerCase();
+    let hit = CITIES.find((c) => c[0].toLowerCase() === canon);
+    if (!hit && canon.length >= 3) hit = CITIES.find((c) => c[0].toLowerCase().indexOf(canon) === 0);
+    return hit ? cityEntry(hit) : null;
+  }
+
+  function insideIndia(lat, lng) {
+    return lat >= INDIA_BOUNDS[0][1] && lat <= INDIA_BOUNDS[1][1] && lng >= INDIA_BOUNDS[0][0] && lng <= INDIA_BOUNDS[1][0];
+  }
+
+  async function geocodeCity(q) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 8000);
+    try {
+      const res = await fetch(
+        "https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&countrycodes=in&q=" + encodeURIComponent(q),
+        { headers: { Accept: "application/json" }, signal: ctrl.signal }
+      );
+      if (!res.ok) throw new Error("lookup failed");
+      const arr = await res.json();
+      if (!arr || !arr.length) return null;
+      const parts = String(arr[0].display_name || q).split(",").map((x) => x.trim());
+      return { name: parts[0] || q, sub: parts.slice(1, 3).join(", "), lat: Number(arr[0].lat), lng: Number(arr[0].lon) };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function searchCity(raw) {
+    const q = String(raw || "").trim();
+    if (q.length < 2) { toast("Type at least two letters of a city name.", "error"); return; }
+
+    let city = findCity(q);
+    if (!city) {
+      const btn = $("citySearchBtn");
+      btn.disabled = true;
+      btn.textContent = "Searching…";
+      try {
+        city = await geocodeCity(q);
+        if (!city) toast("We couldn't find that place in India. Check the spelling or try a nearby larger city.", "error");
+      } catch (err) {
+        toast("City lookup is unavailable right now - try one of the suggested cities.", "error");
+      }
+      btn.disabled = false;
+      btn.textContent = "🔍 Search";
+      if (!city) return;
+    }
+
+    if (!isFinite(city.lat) || !isFinite(city.lng) || !insideIndia(city.lat, city.lng)) {
+      toast("EpideMApp covers India only - that place is outside the map.", "error");
+      return;
+    }
+    showCity(city);
+  }
+
+  function nearMe() {
+    if (!navigator.geolocation) { toast("Location isn't available in this browser. Search for a city instead.", "error"); return; }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const j = jitter(pos.coords.latitude, pos.coords.longitude, 150);
+        if (!insideIndia(j.lat, j.lng)) { toast("Your location is outside India - search for an Indian city instead.", "error"); return; }
+        $("cityInput").value = "";
+        showCity({ name: "Your area", sub: "Based on your approximate location", lat: j.lat, lng: j.lng });
+      },
+      () => toast("Couldn't get your location. Search for a city instead.", "error"),
+      { timeout: 8000, maximumAge: 60000 }
+    );
+  }
+
+  function showCity(city) {
+    svcCity = city;
+    searchedCity = city;
+    const opt = $("radiusCenter").querySelector('option[value="city"]');
+    if (opt) { opt.disabled = false; opt.textContent = "Searched city: " + city.name; }
+    if (city.name !== "Your area") $("cityInput").value = city.name;
+    $("cityEmpty").hidden = true;
+    $("cityResult").hidden = false;
+    renderCityResult();
+  }
+
+  function refreshCityResult() {
+    if (svcCity && !$("cityResult").hidden) renderCityResult();
+  }
+
+  /* Precautions tied to what was actually reported nearby. One tip block per
+     reported type (most-reported first), plus one short general line.
+     General precautions only - not medical advice, and the panel says so. */
+  const TYPE_TIPS = {
+    dengue: ["Aedes mosquitoes that spread dengue bite in the daytime - wear full sleeves and use repellent during the day.",
+             "See a doctor for any fever lasting 2+ days; avoid painkillers like ibuprofen or aspirin unless a doctor advises."],
+    malaria: ["Malaria mosquitoes bite from dusk to dawn - use repellent in the evening and sleep under a net.",
+              "Fever with chills after a visit? Ask for a malaria blood test."],
+    chikungunya: ["Spread by the same daytime mosquito as dengue - cover arms and legs and use repellent.",
+                  "Remove water from coolers, pots and tyres where you are staying."],
+    jp_enceph: ["Avoid rice fields and pig farms at dusk and night in rural areas.",
+                "Sudden fever with confusion or drowsiness needs a hospital immediately."],
+    zika: ["Pregnant? Avoid travel to this area if you can, or take strict mosquito precautions.",
+           "Use repellent and full-sleeved clothing through the day."],
+    other_fever: ["Fevers are being reported - avoid crowded places if you feel unwell and see a doctor early."],
+    stagnant_water: ["Mosquitoes breed in standing water here - use repellent, especially near parks and construction sites."],
+    drainage: ["Avoid walking through overflowing drains or floodwater; wear closed footwear.",
+               "Wash feet and any cuts with soap after contact with dirty water."],
+    garbage: ["Avoid lingering near garbage heaps - they attract rats, flies and stray animals.",
+              "Drink only bottled, boiled or filtered water."],
+    rabies: ["Keep away from stray dogs and unfamiliar animals.",
+             "Any bite or scratch: wash with soap and water for 15 minutes and go to a hospital the same day for the rabies vaccine."],
+    nipah: ["Do not drink raw date-palm sap or eat fruit that may have been bitten by bats.",
+            "Avoid close contact with anyone who has fever with confusion or breathing trouble."],
+    leptospirosis: ["Avoid wading through floodwater or mud, especially with cuts on your feet.",
+                    "Wear closed shoes or boots in waterlogged areas."],
+    scrub_typhus: ["In grass or bushes, wear long trousers tucked into socks and use repellent on skin.",
+                   "Check your body for a black scab-like sore after outdoor trips."],
+    swine_flu: ["Wear a mask in crowded indoor places and wash hands often.",
+                "Avoid contact with pigs and people who have flu-like symptoms."],
+    avian_flu: ["Avoid live bird markets and contact with sick or dead birds.",
+                "Eat only fully cooked chicken and eggs."],
+    anthrax: ["Do not touch dead animals or handle raw meat from unknown sources.",
+              "Eat only well-cooked meat."],
+    brucellosis: ["Drink only boiled or pasteurised milk; avoid raw milk products."],
+    plague: ["Avoid areas with dead rats and use insect repellent against fleas."],
+    kyasanur: ["Avoid forest areas; wear long clothing and tick repellent if you must go."],
+    cchf: ["Avoid contact with livestock blood and ticks; wear gloves when handling animals."],
+    other_zoonotic: ["Keep away from sick or stray animals and wash hands after any animal contact."]
+  };
+
+  function safetyTips(byType) {
+    const keys = Object.keys(byType).sort((a, b) => byType[b] - byType[a]).slice(0, 4);
+    const groups = keys
+      .filter((k) => TYPE_TIPS[k])
+      .map((k) => ({ title: typeInfo(k).icon + " " + typeInfo(k).label + " (" + byType[k] + ")", items: TYPE_TIPS[k] }));
+    groups.push({
+      title: "Always",
+      items: ["Check your city or state health department for official advisories, and see a doctor if you feel unwell."]
+    });
+    return groups;
+  }
+
+  function renderCityResult() {
+    const city = svcCity;
+    if (!city) return;
+
+    const cutoff = Date.now() - svcDays * 86400000;
+    const rows = allReports
+      .filter((r) => r.createdAt.getTime() >= cutoff)
+      .map((r) => ({ r: r, d: haversine(city.lat, city.lng, r.lat, r.lng) }))
+      .filter((x) => x.d <= svcKm);
+
+    const g = { illness: 0, risk: 0, animal: 0 };
+    const byType = {};
+    rows.forEach((x) => {
+      g[typeInfo(x.r.type).group]++;
+      byType[x.r.type] = (byType[x.r.type] || 0) + 1;
+    });
+    const total = rows.length;
+
+    const level = total === 0 ? ["none", "No community reports"]
+      : total < 5 ? ["few", "A few community reports"]
+      : total < 15 ? ["several", "Several community reports"]
+      : ["many", "Many community reports"];
+
+    const typeChips = Object.keys(byType)
+      .sort((a, b) => byType[b] - byType[a])
+      .map((k) => {
+        const t = typeInfo(k);
+        return '<span class="svc-type"><i>' + t.icon + "</i>" + escapeHtml(t.label) + " <em>×" + byType[k] + "</em></span>";
+      })
+      .join("");
+
+    const recent = rows.slice(0, 5)
+      .map((x) => {
+        const t = typeInfo(x.r.type);
+        return (
+          '<div class="r-row"><span>' + t.icon + '</span><span class="r-main">' + escapeHtml(t.label) + "</span>" +
+          '<span class="r-meta">' + fmtDistance(x.d) + " away · " + timeAgo(x.r.createdAt) + "</span></div>"
+        );
+      })
+      .join("");
+
+    const sel = (name, values, current, unit) =>
+      '<select class="time-select" data-svc-' + name + ' aria-label="' + name + '">' +
+      values.map((v) => '<option value="' + v + '"' + (v === current ? " selected" : "") + ">" + v + " " + unit + "</option>").join("") +
+      "</select>";
+
+    const tips = safetyTips(byType)
+      .map((grp) =>
+        '<div class="tip-group">' + escapeHtml(grp.title) + "</div><ul>" +
+        grp.items.map((i) => "<li>" + escapeHtml(i) + "</li>").join("") + "</ul>")
+      .join("");
+
+    const filters = '<div class="bar-row"><span class="bar-label">Within</span>' + sel("km", [10, 25, 50], svcKm, "km") +
+        '<span class="bar-label">Last</span>' + sel("days", [7, 30, 90], svcDays, "days") + "</div>";
+
+    if (!total) {
+      $("cityResult").innerHTML =
+        '<div class="svc-head"><div><h3>' + escapeHtml(city.name) + "</h3>" +
+          '<div class="bar-meta">' + escapeHtml(city.sub || "India") + "</div></div></div>" +
+        filters +
+        '<div class="svc-nodata">' +
+          '<div class="svc-nodata-ic">📭</div>' +
+          "<h4>Not enough data for " + escapeHtml(city.name) + "</h4>" +
+          "<p>No community reports within " + svcKm + " km in the last " + svcDays + " days, so we can't show a picture of this area or give specific advice. " +
+          "This does <b>not</b> mean the area is free of illness - try a wider distance or a longer period, and check your local health department.</p>" +
+          '<a class="btn btn-ghost" href="#report">Be the first to report here</a>' +
+        "</div>";
+      return;
+    }
+
+    $("cityResult").innerHTML =
+      '<div class="svc-head"><div><h3>' + escapeHtml(city.name) + "</h3>" +
+        '<div class="bar-meta">' + escapeHtml(city.sub || "India") + "</div></div>" +
+        '<span class="svc-level ' + level[0] + '">● ' + level[1] + "</span></div>" +
+
+      filters +
+
+      '<div class="svc-tiles">' +
+        '<div class="svc-tile"><b>' + total + "</b><span>Total reports</span></div>" +
+        '<div class="svc-tile"><b>' + g.illness + "</b><span>Diseases</span></div>" +
+        '<div class="svc-tile"><b>' + g.risk + "</b><span>Breeding sites</span></div>" +
+        '<div class="svc-tile"><b>' + g.animal + "</b><span>Animal-borne</span></div>" +
+      "</div>" +
+
+      (total
+        ? '<div><div class="svc-sub">Reported in the last ' + svcDays + " days, within " + svcKm + ' km</div><div class="svc-types">' + typeChips + "</div></div>" +
+          '<div><div class="svc-sub">Most recent</div><div class="svc-recent">' + recent + "</div></div>"
+        : '<div class="svc-note" style="background:var(--bg);border-color:var(--line);color:var(--ink-soft)">No community reports found here in this period. That does <b>not</b> mean there are no cases - few people may be using the app in this area, and reports are unverified.</div>') +
+
+      '<div class="svc-tips"><h4>🧭 Safety tips based on what is reported here</h4>' + tips + "</div>" +
+
+      '<div class="svc-actions">' +
+        '<button class="btn btn-primary" data-svc="map">🗺️ Show on the map</button>' +
+        '<a class="btn btn-ghost" href="#report">📝 Report an issue</a>' +
+      "</div>" +
+
+      '<div class="svc-note"><b>Not a health advice website.</b> These counts come only from unverified community reports and are not an official outbreak status. The tips are precautions based on reported types, not medical advice. Check with your local health department and see a doctor if you feel unwell.</div>';
+  }
+
+  function showCityOnMap() {
+    if (!svcCity) return;
+    searchedCity = svcCity;
+    $("radiusCenter").value = "city";
+    $("radiusSelect").value = String(svcKm);
+    if (svcDays === 7 || svcDays === 30 || svcDays === 90) {
+      $("timeSelect").value = String(svcDays);
+      $("dateRange").hidden = true;
+      timeWindow = svcDays;
+    }
+    applyRadius();
+    document.getElementById("map").scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+
+  function wireServices() {
+    $("cityList").innerHTML = CITIES.map((c) => '<option value="' + escapeHtml(c[0]) + '"></option>').join("");
+    $("cityQuick").innerHTML = QUICK_CITIES
+      .map((n) => '<button class="chip" type="button" data-city="' + n + '">' + n + "</button>")
+      .join("");
+
+    $("cityQuick").addEventListener("click", (e) => {
+      const b = e.target.closest("[data-city]");
+      if (b) searchCity(b.dataset.city);
+    });
+    $("citySearchBtn").addEventListener("click", () => searchCity($("cityInput").value));
+    $("cityInput").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); searchCity($("cityInput").value); } });
+    $("cityNearMeBtn").addEventListener("click", nearMe);
+
+    $("cityResult").addEventListener("change", (e) => {
+      const km = e.target.closest("[data-svc-km]");
+      const days = e.target.closest("[data-svc-days]");
+      if (km) svcKm = Number(km.value);
+      if (days) svcDays = Number(days.value);
+      if (km || days) renderCityResult();
+    });
+    $("cityResult").addEventListener("click", (e) => {
+      if (e.target.closest('[data-svc="map"]')) showCityOnMap();
+    });
   }
 
   /* ================= auth (optional) ================= */
@@ -1332,7 +2348,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
       }
     } catch (err) {
       // Non-fatal: profile sync is a nice-to-have, reporting still works.
-      console.warn("[PandeMApp] Profile sync failed:", err && err.code);
+      console.warn("[EpideMApp] Profile sync failed:", err && err.code);
     }
   }
 
@@ -1343,7 +2359,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
       currentUser = user || null;
       if (user) {
         setAvatar(user);
-        $("panelName").textContent = user.displayName || "PandeMApp user";
+        $("panelName").textContent = user.displayName || "EpideMApp user";
         $("panelEmail").textContent = user.email || "";
         const created = user.metadata && user.metadata.creationTime
           ? new Date(user.metadata.creationTime)
@@ -1351,8 +2367,8 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
         const last = user.metadata && user.metadata.lastSignInTime
           ? new Date(user.metadata.lastSignInTime)
           : null;
-        $("panelCreated").textContent = created ? created.toLocaleDateString("en-IN") : "—";
-        $("panelLastLogin").textContent = last ? last.toLocaleString("en-IN") : "—";
+        $("panelCreated").textContent = created ? created.toLocaleDateString("en-IN") : "-";
+        $("panelLastLogin").textContent = last ? last.toLocaleString("en-IN") : "-";
         syncUserProfile(user);
       }
       updateAccountUI();
@@ -1369,8 +2385,8 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
         await auth.signInWithPopup(fb.provider);
         toast("Signed in. Your reports are now linked to your account.", "success");
       } catch (err) {
-        console.warn("[PandeMApp] Sign-in failed:", err && err.code, err && err.message);
-        toast("Sign-in failed — you can keep using PandeMApp as a guest.", "error");
+        console.warn("[EpideMApp] Sign-in failed:", err && err.code, err && err.message);
+        toast("Sign-in failed - you can keep using EpideMApp as a guest.", "error");
       } finally {
         btn.disabled = false;
         btn.textContent = old;
@@ -1394,6 +2410,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
     renderFeed();
     renderStats();
     updateLegendCounts();
+    refreshCityResult();
     updateAccountUI();
     if (meta) updateModeChip(meta);
   }
@@ -1403,11 +2420,11 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
     const live = meta.mode === "firestore";
     const offline = live && meta.offline;
     chip.classList.toggle("local", !live || offline);
-    $("modeChipText").textContent = !live ? "This browser only" : (offline ? "Offline — will sync" : "Live database");
+    $("modeChipText").textContent = !live ? "This browser only" : (offline ? "Offline - will sync" : "Live database");
     $("sourceText").textContent = !live ? "this browser (local demo)" : (offline ? "queued, syncs when online" : "shared cloud database");
     chip.title = live
       ? "Reports are shared with everyone through Firestore."
-      : "Firestore is unreachable or blocked by security rules — reports are stored locally. See firestore.rules in the README.";
+      : "Firestore is unreachable or blocked by security rules - reports are stored locally. See firestore.rules in the README.";
   }
 
   /* ================= wiring ================= */
@@ -1424,34 +2441,47 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
     $("panelToggle").addEventListener("click", () => $("barPanel").classList.toggle("collapsed"));
 
     // map / card triggers
-    $("headerReportBtn").addEventListener("click", () => openReportModal("stagnant_water"));
+    // clicking the logo scrolls back to the top of the page
+    const toTop = () => window.scrollTo({ top: 0, behavior: "smooth" });
+    $("brandHome").addEventListener("click", toTop);
+    $("brandHome").addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toTop(); }
+    });
+    /* feed age filter */
+    $("feedAge").addEventListener("change", (e) => { feedAge = e.target.value; renderFeed(); });
+
+    /* in-page links: land exactly below the sticky header + section bar */
+    const setStickyOffset = () => {
+      const h = (document.querySelector("header.navbar") || {}).offsetHeight || 0;
+      const n = (document.querySelector(".page-nav") || {}).offsetHeight || 0;
+      document.documentElement.style.setProperty("--sticky-h", (h + n + 12) + "px");
+    };
+    setStickyOffset();
+    window.addEventListener("resize", setStickyOffset);
+
+    /* disclaimer close - stays hidden for the rest of this visit */
+    const disc = $("disclaimerBar");
+    if (disc) {
+      if (sessionStorage.getItem("pm.disclaimerClosed") === "1") disc.hidden = true;
+      $("disclaimerClose").addEventListener("click", () => {
+        disc.hidden = true;
+        sessionStorage.setItem("pm.disclaimerClosed", "1");
+      });
+    }
+    $("headerReportBtn").addEventListener("click", () => {
+      document.getElementById("report").scrollIntoView({ behavior: "smooth", block: "start" });
+    });
     $("modalCloseBtn").addEventListener("click", closeReportModal);
     $("cancelReportBtn").addEventListener("click", closeReportModal);
 
-    /* animal-spread form — same page, its own UI */
+    /* animal-spread form - same page, its own UI */
     buildAnimalTypes();
     buildAnimalExposure();
     buildAnimalSeverity();
-    $("animalReportBtn").addEventListener("click", openAnimalModal);
     $("animalModalCloseBtn").addEventListener("click", closeAnimalModal);
     $("animalCancelBtn").addEventListener("click", closeAnimalModal);
     $("animalExposure").addEventListener("change", refreshAnimalAlert);
-    $("animalNoteInput").addEventListener("input", (e) => {
-      $("animalCharCount").textContent = e.target.value.length;
-    });
-    $("animalPhotoPickBtn").addEventListener("click", () => $("animalPhotoInput").click());
-    $("animalPhotoRemoveBtn").addEventListener("click", () => setAnimalPhoto(null));
-    $("animalPhotoInput").addEventListener("change", async (e) => {
-      const file = e.target.files && e.target.files[0];
-      if (!file) return;
-      try {
-        setAnimalPhoto(await Images.compress(file));
-        toast("Photo ready — " + Math.round(aPhoto.length / 1024) + " KB after compressing.", "success");
-      } catch (err) {
-        console.warn("[PandeMApp] Photo failed:", err);
-        toast("That image couldn't be read. Try a different one.", "error");
-      }
-    });
+    wireFileInputs();
     $("animalLocateBtn").addEventListener("click", () => {
       if (!navigator.geolocation) { toast("Location isn't available in this browser.", "error"); return; }
       navigator.geolocation.getCurrentPosition(
@@ -1467,25 +2497,6 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
     });
     $("animalSubmitBtn").addEventListener("click", submitAnimalReport);
     $("submitReportBtn").addEventListener("click", submitReport);
-    $("photoPickBtn").addEventListener("click", () => $("photoInput").click());
-    $("photoRemoveBtn").addEventListener("click", () => setPendingPhoto(null));
-    $("photoInput").addEventListener("change", async (e) => {
-      const file = e.target.files && e.target.files[0];
-      if (!file) return;
-      if (!/^image\//.test(file.type)) { toast("That file isn't an image.", "error"); return; }
-      const btn = $("photoPickBtn");
-      btn.disabled = true;
-      btn.textContent = "⏳ Processing…";
-      try {
-        setPendingPhoto(await compressImage(file));
-        toast("Photo ready — " + Math.round(pendingPhoto.length / 1024) + " KB after compressing.", "success");
-      } catch (err) {
-        toast(err && err.message ? err.message : "Could not read that image.", "error");
-        setPendingPhoto(null);
-      }
-      btn.disabled = false;
-    });
-
     // Photos open in a lightbox; the id keeps data URLs out of the DOM attributes.
     document.addEventListener("click", (e) => {
       const thumb = e.target.closest("[data-photoid]");
@@ -1493,13 +2504,16 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
       e.stopPropagation();
       openLightbox(thumb.getAttribute("data-photoid"));
     });
+    document.addEventListener("click", (e) => {
+      const a = e.target.closest("[data-fileid]");
+      if (!a) return;
+      e.preventDefault();
+      e.stopPropagation();
+      openAttachment(a.getAttribute("data-fileid"));
+    });
     $("lbCloseBtn").addEventListener("click", closeLightbox);
     $("lightbox").addEventListener("click", (e) => { if (e.target.id !== "lightboxImg") closeLightbox(); });
     document.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeLightbox(); closePanels(); } });
-
-    $("noteInput").addEventListener("input", (e) => {
-      $("charCount").textContent = e.target.value.length;
-    });
 
     $("useMyLocationBtn").addEventListener("click", () => {
       if (!navigator.geolocation) { toast("Location is not available in this browser.", "error"); return; }
@@ -1514,7 +2528,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
         },
         () => {
           btn.innerHTML = "📍 Use my location";
-          toast("Couldn't get your location — tap the map instead.", "error");
+          toast("Couldn't get your location - tap the map instead.", "error");
           $("geoBanner").classList.add("show");
         },
         { timeout: 8000 }
@@ -1522,12 +2536,11 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
     });
 
 
-    $("timeSelect").addEventListener("change", (e) => {
-      timeWindow = Number(e.target.value);
-      renderMarkers();
-      renderFeed();
-      renderStats();
-    });
+    wireDateFilter();
+    wireRadius();
+    wireReportTabs();
+    wireSymptomCheckers();
+    wireServices();
 
     $("locateBtn").addEventListener("click", () => {
       if (userLatLng) map.flyTo({ center: [userLatLng.lng, userLatLng.lat], zoom: 13 });
@@ -1553,7 +2566,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
     Store.onChange(renderAll);
     Store.init().then((mode) => {
       if (mode !== "firestore") {
-        toast("Running in local mode — reports stay in this browser until Firestore rules are published.", "info");
+        toast("Running in local mode - reports stay in this browser until Firestore rules are published.", "info");
       }
     });
   }
@@ -1564,7 +2577,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
     if (!$("reportModal").classList.contains("show")) $("overlay").classList.remove("show");
   }
 
-  /* Small debug handle — handy in the browser console and for automated checks. */
+  /* Small debug handle - handy in the browser console and for automated checks. */
   window.__healthmap = {
     getMap: () => map,
     isLoaded: () => mapLoaded,
@@ -1578,6 +2591,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-
     },
     getReports: () => allReports,
     getMode: () => Store.getMode(),
+    showReportTab: (n) => showReportTab(n),
     INDIA_BOUNDS
   };
 
